@@ -6,11 +6,12 @@ package stun
 import (
 	"errors"
 	"flag"
+	"fmt"
 	"net"
 	"time"
 
 	"github.com/pion/stun"
-	"go.uber.org/zap"
+	log "github.com/sirupsen/logrus"
 )
 
 type stunServerConn struct {
@@ -25,165 +26,156 @@ func (c *stunServerConn) Close() error {
 	return c.conn.Close()
 }
 
-var (
-	addrStrPtr = flag.String("server", "stun.miwifi.com:3478", "STUN server address")             //nolint:gochecknoglobals
-	timeoutPtr = flag.Int("timeout", 3, "the number of seconds to wait for STUN server's response") //nolint:gochecknoglobals
-	logger *zap.SugaredLogger
+type NATMappingBehavior int
+type NATFilteringBehavior int
+
+const (
+	NoNAT NATMappingBehavior = iota
+	EndpointIndependentMapping
+	AddressDependentMapping
+	AddressAndPortDependentMapping
+	UnknownMapping
 )
 
 const (
-	messageHeaderSize = 20
+	EndpointIndependentFiltering NATFilteringBehavior = iota + 10
+	AddressDependentFiltering
+	AddressAndPortDependentFiltering
+	UnknownFiltering
 )
 
 var (
-	errResponseMessage = errors.New("error reading from response message channel")
-	errTimedOut        = errors.New("timed out waiting for response")
-	errNoOtherAddress  = errors.New("no OTHER-ADDRESS in message")
+	timeoutPtr = flag.Int("timeout", 3, "time to wait for STUN server's response (in seconds)")
 )
 
-func Start() {
-
-	logger = zap.L().Sugar()
-	logger.Infof("Hello!")
-	
-
-	if err := mappingTests(*addrStrPtr); err != nil {
-		logger.Infof("NAT mapping behavior: inconclusive")
-	}
-	if err := filteringTests(*addrStrPtr); err != nil {
-		logger.Infof("NAT filtering behavior: inconclusive")
-	}
-}
-
 // RFC5780: 4.3.  Determining NAT Mapping Behavior
-func mappingTests(addrStr string) error {
+func MappingTests(addrStr string) (NATMappingBehavior, error) {
 	mapTestConn, err := connect(addrStr)
 	if err != nil {
-		logger.Warnf("Error creating STUN connection: %s", err)
-		return err
+		log.Warnf("Error creating STUN connection: %s", err)
+		return UnknownMapping, err
 	}
+	defer mapTestConn.Close()
 
 	// Test I: Regular binding request
-	logger.Info("Mapping Test I: Regular binding request")
+	log.Debug("Mapping Test I: Regular binding request")
 	request := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 
 	resp, err := mapTestConn.roundTrip(request, mapTestConn.RemoteAddr)
 	if err != nil {
-		return err
+		return UnknownMapping, err
 	}
 
 	// Parse response message for XOR-MAPPED-ADDRESS and make sure OTHER-ADDRESS valid
 	resps1 := parse(resp)
 	if resps1.xorAddr == nil || resps1.otherAddr == nil {
-		logger.Info("Error: NAT discovery feature not supported by this server")
-		return errNoOtherAddress
+		log.Debug("Error: NAT discovery feature not supported by this server")
+		return UnknownMapping, fmt.Errorf("no OTHER-ADDRESS in message, NAT discovery feature not supported by %s", addrStr)
 	}
+
 	addr, err := net.ResolveUDPAddr("udp4", resps1.otherAddr.String())
 	if err != nil {
-		logger.Infof("Failed resolving OTHER-ADDRESS: %v", resps1.otherAddr)
-		return err
+		log.Debugf("Failed resolving OTHER-ADDRESS: %v", resps1.otherAddr)
+		return UnknownMapping, err
 	}
 	mapTestConn.OtherAddr = addr
-	logger.Infof("Received XOR-MAPPED-ADDRESS: %v", resps1.xorAddr)
+	log.Debugf("Received XOR-MAPPED-ADDRESS: %v", resps1.xorAddr)
 
 	// Assert mapping behavior
 	if resps1.xorAddr.String() == mapTestConn.LocalAddr.String() {
-		logger.Warn("=> NAT mapping behavior: endpoint independent (no NAT)")
-		return nil
+		return NoNAT, nil
 	}
 
 	// Test II: Send binding request to the other address but primary port
-	logger.Info("Mapping Test II: Send binding request to the other address but primary port")
+	log.Debug("Mapping Test II: Send binding request to the other address but primary port")
 	oaddr := *mapTestConn.OtherAddr
 	oaddr.Port = mapTestConn.RemoteAddr.Port
 	resp, err = mapTestConn.roundTrip(request, &oaddr)
 	if err != nil {
-		return err
+		return UnknownMapping, err
 	}
 
 	// Assert mapping behavior
 	resps2 := parse(resp)
-	logger.Infof("Received XOR-MAPPED-ADDRESS: %v", resps2.xorAddr)
+	log.Debugf("Received XOR-MAPPED-ADDRESS: %v", resps2.xorAddr)
 	if resps2.xorAddr.String() == resps1.xorAddr.String() {
-		logger.Warn("=> NAT mapping behavior: endpoint independent")
-		return nil
+		return EndpointIndependentMapping, nil
 	}
 
 	// Test III: Send binding request to the other address and port
-	logger.Info("Mapping Test III: Send binding request to the other address and port")
+	log.Debug("Mapping Test III: Send binding request to the other address and port")
 	resp, err = mapTestConn.roundTrip(request, mapTestConn.OtherAddr)
 	if err != nil {
-		return err
+		return UnknownMapping, err
 	}
 
 	// Assert mapping behavior
 	resps3 := parse(resp)
-	logger.Infof("Received XOR-MAPPED-ADDRESS: %v", resps3.xorAddr)
+	log.Debugf("Received XOR-MAPPED-ADDRESS: %v", resps3.xorAddr)
 	if resps3.xorAddr.String() == resps2.xorAddr.String() {
-		logger.Warn("=> NAT mapping behavior: address dependent")
+		return AddressDependentMapping, nil
 	} else {
-		logger.Warn("=> NAT mapping behavior: address and port dependent")
+		return AddressAndPortDependentMapping, nil
 	}
-
-	return mapTestConn.Close()
 }
 
 // RFC5780: 4.4.  Determining NAT Filtering Behavior
-func filteringTests(addrStr string) error {
+func FilteringTests(addrStr string) (NATFilteringBehavior, error) {
 	mapTestConn, err := connect(addrStr)
 	if err != nil {
-		logger.Warnf("Error creating STUN connection: %s", err)
-		return err
+		log.Warnf("Error creating STUN connection: %s", err)
+		return UnknownFiltering, err
 	}
+	defer mapTestConn.Close()
 
 	// Test I: Regular binding request
-	logger.Info("Filtering Test I: Regular binding request")
+	log.Debug("Filtering Test I: Regular binding request")
 	request := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 
 	resp, err := mapTestConn.roundTrip(request, mapTestConn.RemoteAddr)
-	if err != nil || errors.Is(err, errTimedOut) {
-		return err
+	if err != nil {
+		return UnknownFiltering, err
 	}
 	resps := parse(resp)
 	if resps.xorAddr == nil || resps.otherAddr == nil {
-		logger.Warn("Error: NAT discovery feature not supported by this server")
-		return errNoOtherAddress
+		log.Debug("Error: NAT discovery feature not supported by this server")
+		return UnknownFiltering, fmt.Errorf("no OTHER-ADDRESS in message, NAT discovery feature not supported by %s", addrStr)
 	}
+
 	addr, err := net.ResolveUDPAddr("udp4", resps.otherAddr.String())
 	if err != nil {
-		logger.Infof("Failed resolving OTHER-ADDRESS: %v", resps.otherAddr)
-		return err
+		log.Debugf("Failed resolving OTHER-ADDRESS: %v", resps.otherAddr)
+		return UnknownFiltering, err
 	}
 	mapTestConn.OtherAddr = addr
 
 	// Test II: Request to change both IP and port
-	logger.Info("Filtering Test II: Request to change both IP and port")
+	log.Debug("Filtering Test II: Request to change both IP and port")
 	request = stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 	request.Add(stun.AttrChangeRequest, []byte{0x00, 0x00, 0x00, 0x06})
 
 	resp, err = mapTestConn.roundTrip(request, mapTestConn.RemoteAddr)
 	if err == nil {
 		parse(resp) // just to print out the resp
-		logger.Warn("=> NAT filtering behavior: endpoint independent")
-		return nil
-	} else if !errors.Is(err, errTimedOut) {
-		return err // something else went wrong
+		return EndpointIndependentFiltering, nil
+	} else if err.Error() != "timed out waiting for response" {
+		return UnknownFiltering, err
 	}
 
 	// Test III: Request to change port only
-	logger.Info("Filtering Test III: Request to change port only")
+	log.Debug("Filtering Test III: Request to change port only")
 	request = stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 	request.Add(stun.AttrChangeRequest, []byte{0x00, 0x00, 0x00, 0x02})
 
 	resp, err = mapTestConn.roundTrip(request, mapTestConn.RemoteAddr)
 	if err == nil {
 		parse(resp) // just to print out the resp
-		logger.Warn("=> NAT filtering behavior: address dependent")
-	} else if errors.Is(err, errTimedOut) {
-		logger.Warn("=> NAT filtering behavior: address and port dependent")
+		return AddressDependentFiltering, nil
+	} else if err.Error() == "timed out waiting for response" {
+		return AddressAndPortDependentFiltering, nil
+	} else {
+		return UnknownFiltering, err
 	}
-
-	return mapTestConn.Close()
 }
 
 // Parse a STUN message
@@ -215,12 +207,13 @@ func parse(msg *stun.Message) (ret struct {
 	if ret.software.GetFrom(msg) != nil {
 		ret.software = nil
 	}
-	logger.Debugf("%v", msg)
-	logger.Debugf("\tMAPPED-ADDRESS:     %v", ret.mappedAddr)
-	logger.Debugf("\tXOR-MAPPED-ADDRESS: %v", ret.xorAddr)
-	logger.Debugf("\tRESPONSE-ORIGIN:    %v", ret.respOrigin)
-	logger.Debugf("\tOTHER-ADDRESS:      %v", ret.otherAddr)
-	logger.Debugf("\tSOFTWARE: %v", ret.software)
+	log.Tracef("%v", msg)
+	log.Tracef("\tMAPPED-ADDRESS:     %v", ret.mappedAddr)
+	log.Tracef("\tXOR-MAPPED-ADDRESS: %v", ret.xorAddr)
+	log.Tracef("\tRESPONSE-ORIGIN:    %v", ret.respOrigin)
+	log.Tracef("\tOTHER-ADDRESS:      %v", ret.otherAddr)
+	log.Tracef("\tSOFTWARE: %v", ret.software)
+
 	for _, attr := range msg.Attributes {
 		switch attr.Type {
 		case
@@ -229,87 +222,56 @@ func parse(msg *stun.Message) (ret struct {
 			stun.AttrResponseOrigin,
 			stun.AttrMappedAddress,
 			stun.AttrSoftware:
-			break //nolint:staticcheck
+			// already printed, do nothing
 		default:
-			logger.Debugf("\t%v (l=%v)", attr, attr.Length)
+			log.Tracef("\t%v (l=%v)", attr, attr.Length)
 		}
 	}
+
 	return ret
 }
 
 // Given an address string, returns a StunServerConn
 func connect(addrStr string) (*stunServerConn, error) {
-	logger.Infof("Connecting to STUN server: %s", addrStr)
+	log.Debugf("Connecting to STUN server: %s", addrStr)
 	addr, err := net.ResolveUDPAddr("udp4", addrStr)
 	if err != nil {
-		logger.Warnf("Error resolving address: %s", err)
+		log.Warnf("Error resolving address: %s", err)
 		return nil, err
 	}
 
-	c, err := net.ListenUDP("udp4", nil)
+	// Just to get real local address
+	c, _ := net.DialUDP("udp4", nil, addr)
+	localAddr := c.LocalAddr()
+
+	// Create a new connection
+	c, err = net.ListenUDP("udp4", nil)
 	if err != nil {
 		return nil, err
 	}
-	logger.Infof("Local address: %s", c.LocalAddr())
-	logger.Infof("Remote address: %s", addr.String())
+	log.Debugf("Local address: %s", localAddr)
+	log.Debugf("Remote address: %s", addr.String())
 
-	mChan := listen(c)
-
-	return &stunServerConn{
-		conn:        c,
-		LocalAddr:   c.LocalAddr(),
-		RemoteAddr:  addr,
-		messageChan: mChan,
-	}, nil
-}
-
-// Send request and wait for response or timeout
-func (c *stunServerConn) roundTrip(msg *stun.Message, addr net.Addr) (*stun.Message, error) {
-	_ = msg.NewTransactionID()
-	logger.Infof("Sending to %v: (%v bytes)", addr, msg.Length+messageHeaderSize)
-	logger.Debugf("%v", msg)
-	for _, attr := range msg.Attributes {
-		logger.Debugf("\t%v (l=%v)", attr, attr.Length)
-	}
-	_, err := c.conn.WriteTo(msg.Raw, addr)
-	if err != nil {
-		logger.Warnf("Error sending request to %v", addr)
-		return nil, err
-	}
-
-	// Wait for response or timeout
-	select {
-	case m, ok := <-c.messageChan:
-		if !ok {
-			return nil, errResponseMessage
-		}
-		return m, nil
-	case <-time.After(time.Duration(*timeoutPtr) * time.Second):
-		logger.Infof("Timed out waiting for response from server %v", addr)
-		return nil, errTimedOut
-	}
-}
-
-// taken from https://github.com/pion/stun/blob/master/cmd/stun-traversal/main.go
-func listen(conn *net.UDPConn) (messages chan *stun.Message) {
-	messages = make(chan *stun.Message)
+	// Start reading messages
+	messages := make(chan *stun.Message)
 	go func() {
 		for {
 			buf := make([]byte, 1024)
 
-			n, addr, err := conn.ReadFromUDP(buf)
+			n, addr, err := c.ReadFromUDP(buf)
 			if err != nil {
+				log.Tracef("Error reading from UDP, messsage channel closing: %v", err)
 				close(messages)
 				return
 			}
-			logger.Infof("Response from %v: (%v bytes)", addr, n)
+			log.Debugf("Response from %v: (%v bytes)", addr, n)
 			buf = buf[:n]
 
 			m := new(stun.Message)
 			m.Raw = buf
 			err = m.Decode()
 			if err != nil {
-				logger.Infof("Error decoding message: %v", err)
+				log.Warnf("Error decoding message: %v", err)
 				close(messages)
 				return
 			}
@@ -317,5 +279,40 @@ func listen(conn *net.UDPConn) (messages chan *stun.Message) {
 			messages <- m
 		}
 	}()
-	return
+
+	return &stunServerConn{
+		conn:        c,
+		LocalAddr:   localAddr,
+		RemoteAddr:  addr,
+		messageChan: messages,
+	}, nil
+}
+
+// Send request and wait for response or timeout
+func (c *stunServerConn) roundTrip(msg *stun.Message, addr net.Addr) (*stun.Message, error) {
+	_ = msg.NewTransactionID()
+	log.Debugf("Sending to %v: (%v bytes)", addr, msg.Length+20) // 20 is Message header size
+
+	log.Tracef("%v", msg)
+	for _, attr := range msg.Attributes {
+		log.Tracef("\t%v (l=%v)", attr, attr.Length)
+	}
+
+	_, err := c.conn.WriteTo(msg.Raw, addr)
+	if err != nil {
+		log.Warnf("Error sending request to %v: %s", addr, err.Error())
+		return nil, err
+	}
+
+	// Wait for response or timeout
+	select {
+	case m, ok := <-c.messageChan:
+		if !ok {
+			return nil, errors.New("error reading from response message channel")
+		}
+		return m, nil
+	case <-time.After(time.Duration(*timeoutPtr) * time.Second):
+		log.Debugf("Timed out waiting for response from server %v", addr)
+		return nil, errors.New("timed out waiting for response")
+	}
 }
