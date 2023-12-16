@@ -3,6 +3,7 @@ module github.com/lyc8503/nathole
 go 1.21
 
 require (
+	github.com/libp2p/go-reuseport v0.4.0
 	github.com/pion/stun v0.6.1
 	github.com/sirupsen/logrus v1.9.3
 )

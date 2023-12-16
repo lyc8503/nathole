@@ -10,6 +10,7 @@ import (
 	"net"
 	"time"
 
+	reuse "github.com/libp2p/go-reuseport"
 	"github.com/pion/stun"
 	log "github.com/sirupsen/logrus"
 )
@@ -37,6 +38,23 @@ const (
 	UnknownMapping
 )
 
+func (mapping NATMappingBehavior) String() string {
+	switch mapping {
+	case NoNAT:
+		return "No NAT"
+	case EndpointIndependentMapping:
+		return "Endpoint Independent Mapping"
+	case AddressDependentMapping:
+		return "Address Dependent Mapping"
+	case AddressAndPortDependentMapping:
+		return "Address and Port Dependent Mapping"
+	case UnknownMapping:
+		return "Unknown Mapping"
+	default:
+		return "INVALID"
+	}
+}
+
 const (
 	EndpointIndependentFiltering NATFilteringBehavior = iota + 10
 	AddressDependentFiltering
@@ -44,13 +62,28 @@ const (
 	UnknownFiltering
 )
 
+func (filtering NATFilteringBehavior) String() string {
+	switch filtering {
+	case EndpointIndependentFiltering:
+		return "Endpoint Independent Filtering"
+	case AddressDependentFiltering:
+		return "Address Dependent Filtering"
+	case AddressAndPortDependentFiltering:
+		return "Address and Port Dependent Filtering"
+	case UnknownFiltering:
+		return "Unknown Filtering"
+	default:
+		return "INVALID"
+	}
+}
+
 var (
 	timeoutPtr = flag.Int("timeout", 3, "time to wait for STUN server's response (in seconds)")
 )
 
 // RFC5780: 4.3.  Determining NAT Mapping Behavior
-func MappingTests(addrStr string) (NATMappingBehavior, error) {
-	mapTestConn, err := connect(addrStr)
+func MappingTests(addrStr string, network string) (NATMappingBehavior, error) {
+	mapTestConn, err := connect(addrStr, network)
 	if err != nil {
 		log.Warnf("Error creating STUN connection: %s", err)
 		return UnknownMapping, err
@@ -69,13 +102,13 @@ func MappingTests(addrStr string) (NATMappingBehavior, error) {
 	// Parse response message for XOR-MAPPED-ADDRESS and make sure OTHER-ADDRESS valid
 	resps1 := parse(resp)
 	if resps1.xorAddr == nil || resps1.otherAddr == nil {
-		log.Debug("Error: NAT discovery feature not supported by this server")
+		log.Warn("Error: NAT discovery feature not supported by this server")
 		return UnknownMapping, fmt.Errorf("no OTHER-ADDRESS in message, NAT discovery feature not supported by %s", addrStr)
 	}
 
-	addr, err := net.ResolveUDPAddr("udp4", resps1.otherAddr.String())
+	addr, err := net.ResolveUDPAddr(network, resps1.otherAddr.String())
 	if err != nil {
-		log.Debugf("Failed resolving OTHER-ADDRESS: %v", resps1.otherAddr)
+		log.Warnf("Failed resolving OTHER-ADDRESS: %v", resps1.otherAddr)
 		return UnknownMapping, err
 	}
 	mapTestConn.OtherAddr = addr
@@ -120,8 +153,8 @@ func MappingTests(addrStr string) (NATMappingBehavior, error) {
 }
 
 // RFC5780: 4.4.  Determining NAT Filtering Behavior
-func FilteringTests(addrStr string) (NATFilteringBehavior, error) {
-	mapTestConn, err := connect(addrStr)
+func FilteringTests(addrStr string, network string) (NATFilteringBehavior, error) {
+	mapTestConn, err := connect(addrStr, network)
 	if err != nil {
 		log.Warnf("Error creating STUN connection: %s", err)
 		return UnknownFiltering, err
@@ -138,11 +171,11 @@ func FilteringTests(addrStr string) (NATFilteringBehavior, error) {
 	}
 	resps := parse(resp)
 	if resps.xorAddr == nil || resps.otherAddr == nil {
-		log.Debug("Error: NAT discovery feature not supported by this server")
+		log.Warn("Error: NAT discovery feature not supported by this server")
 		return UnknownFiltering, fmt.Errorf("no OTHER-ADDRESS in message, NAT discovery feature not supported by %s", addrStr)
 	}
 
-	addr, err := net.ResolveUDPAddr("udp4", resps.otherAddr.String())
+	addr, err := net.ResolveUDPAddr(network, resps.otherAddr.String())
 	if err != nil {
 		log.Debugf("Failed resolving OTHER-ADDRESS: %v", resps.otherAddr)
 		return UnknownFiltering, err
@@ -232,20 +265,24 @@ func parse(msg *stun.Message) (ret struct {
 }
 
 // Given an address string, returns a StunServerConn
-func connect(addrStr string) (*stunServerConn, error) {
+func connect(addrStr string, network string) (*stunServerConn, error) {
 	log.Debugf("Connecting to STUN server: %s", addrStr)
-	addr, err := net.ResolveUDPAddr("udp4", addrStr)
+	addr, err := net.ResolveUDPAddr(network, addrStr)
 	if err != nil {
 		log.Warnf("Error resolving address: %s", err)
 		return nil, err
 	}
 
 	// Just to get real local address
-	c, _ := net.DialUDP("udp4", nil, addr)
+	c, err := net.DialUDP(network, nil, addr)
+	if err != nil {
+		return nil, err
+	}
 	localAddr := c.LocalAddr()
+	c.Close()
 
 	// Create a new connection
-	c, err = net.ListenUDP("udp4", nil)
+	c, err = net.ListenUDP(network, localAddr.(*net.UDPAddr))
 	if err != nil {
 		return nil, err
 	}
@@ -315,4 +352,51 @@ func (c *stunServerConn) roundTrip(msg *stun.Message, addr net.Addr) (*stun.Mess
 		log.Debugf("Timed out waiting for response from server %v", addr)
 		return nil, errors.New("timed out waiting for response")
 	}
+}
+
+// use STUN server to create a new binding and return the local and mapped address
+func GetTCP4MappedAddress(stunServer string) (localAddr string, mappedAddr string, err error) {
+	if !reuse.Available() {
+		err = errors.New("reuseport is not available on this platform")
+		return
+	}
+
+	// Connect to STUN server
+	stunConn, err := reuse.DialTimeout("tcp4", "0.0.0.0:0", stunServer, time.Duration(*timeoutPtr)*time.Second)
+	if err != nil {
+		log.Warnf("Error connecting to STUN server: %v", err)
+		return
+	}
+	defer stunConn.Close()
+
+	localAddr = stunConn.LocalAddr().(*net.TCPAddr).String()
+	remoteAddr := stunConn.RemoteAddr().(*net.TCPAddr).String()
+	log.Debugf("TCP local address: %s", localAddr)
+	log.Debugf("TCP remote address: %s", remoteAddr)
+
+	request := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
+	n, err := stunConn.Write(request.Raw)
+	if err != nil {
+		log.Warnf("Error writing to STUN server: %v", err)
+		return
+	}
+	log.Debugf("Sent %v bytes to %s", n, remoteAddr)
+
+	buf := make([]byte, 1024)
+	n, err = stunConn.Read(buf)
+	if err != nil {
+		log.Warnf("Error reading from STUN server: %v", err)
+		return
+	}
+
+	log.Debugf("Received %v bytes from %s", n, remoteAddr)
+	m := new(stun.Message)
+	m.Raw = buf[:n]
+	m.Decode()
+
+	resp := parse(m)
+	mappedAddr = resp.xorAddr.String()
+	log.Debugf("Received XOR-MAPPED-ADDRESS: %s", mappedAddr)
+
+	return
 }
